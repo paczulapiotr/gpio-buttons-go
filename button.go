@@ -12,45 +12,42 @@ import (
 	"periph.io/x/host/v3"
 )
 
-// ButtonCallback is a function type that gets called when a button is pressed
+const (
+	defaultDebounceTime = 50 * time.Millisecond
+	defaultPull         = gpio.PullUp
+)
+
+// ButtonCallback is invoked when a button press is detected.
 type ButtonCallback func(pinName string)
 
-// ButtonConfig represents the configuration for a single button
+// ButtonConfig defines the configuration for a single GPIO button.
 type ButtonConfig struct {
-	// PinName is the name of the GPIO pin (e.g., "GPIO1_A0", "GPIO1_A1")
-	PinName string
-	
-	// Callback is the function to call when the button is pressed
-	Callback ButtonCallback
-	
-	// DebounceTime is the time to wait before considering another press (default: 50ms)
-	DebounceTime time.Duration
-	
-	// Pull configures the pin's pull resistor (default: PullUp)
-	Pull gpio.Pull
+	PinName      string         // GPIO pin name (e.g., "GPIO1_A0")
+	Callback     ButtonCallback // Function called on button press
+	DebounceTime time.Duration  // Minimum time between presses (default: 50ms)
+	Pull         gpio.Pull      // Pull resistor configuration (default: PullUp)
 }
 
-// ButtonManager manages multiple GPIO buttons
+// ButtonManager manages multiple GPIO button inputs with interrupt-driven detection.
 type ButtonManager struct {
-	buttons      map[string]*button
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	mu           sync.Mutex
-	initialized  bool
+	buttons map[string]*button
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	mu      sync.Mutex
 }
 
-// button represents an internal button state
+// button represents the internal state of a single button.
 type button struct {
-	pin          gpio.PinIO
-	config       ButtonConfig
-	lastPress    time.Time
-	mu           sync.Mutex
+	pin       gpio.PinIO
+	config    ButtonConfig
+	lastPress time.Time
+	mu        sync.Mutex
 }
 
-// NewButtonManager creates a new ButtonManager instance
+// NewButtonManager creates and initializes a new ButtonManager.
+// It initializes the periph.io host for GPIO access.
 func NewButtonManager() (*ButtonManager, error) {
-	// Initialize periph.io host
 	if _, err := host.Init(); err != nil {
 		return nil, fmt.Errorf("failed to initialize periph.io: %w", err)
 	}
@@ -58,37 +55,32 @@ func NewButtonManager() (*ButtonManager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	return &ButtonManager{
-		buttons:     make(map[string]*button),
-		ctx:         ctx,
-		cancel:      cancel,
-		initialized: true,
+		buttons: make(map[string]*button),
+		ctx:     ctx,
+		cancel:  cancel,
 	}, nil
 }
 
-// AddButton adds a button configuration to the manager
+// AddButton registers a new button with the manager.
+// Must be called before Start().
 func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
-	if !bm.initialized {
-		return fmt.Errorf("button manager not initialized")
-	}
-
-	// Set defaults
+	// Apply defaults
 	if config.DebounceTime == 0 {
-		config.DebounceTime = 50 * time.Millisecond
+		config.DebounceTime = defaultDebounceTime
 	}
 	if config.Pull == gpio.PullNoChange {
-		config.Pull = gpio.PullUp
+		config.Pull = defaultPull
 	}
 
-	// Look up the GPIO pin
+	// Validate and configure GPIO pin
 	pin := gpioreg.ByName(config.PinName)
 	if pin == nil {
 		return fmt.Errorf("failed to find pin: %s", config.PinName)
 	}
 
-	// Configure the pin as input with pull-up resistor
 	if err := pin.In(config.Pull, gpio.BothEdges); err != nil {
 		return fmt.Errorf("failed to configure pin %s: %w", config.PinName, err)
 	}
@@ -102,7 +94,8 @@ func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 	return nil
 }
 
-// Start begins monitoring all configured buttons
+// Start begins monitoring all configured buttons using hardware interrupts.
+// Returns an error if no buttons are configured.
 func (bm *ButtonManager) Start() error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -116,77 +109,111 @@ func (bm *ButtonManager) Start() error {
 		go bm.monitorButton(btn)
 	}
 
-	log.Printf("Started monitoring %d buttons", len(bm.buttons))
+	log.Printf("Started monitoring %d button(s)", len(bm.buttons))
 	return nil
 }
 
-// monitorButton monitors a single button for press events
+// monitorButton handles button press detection using GPIO hardware interrupts.
+// This is event-driven, not polling-based, for maximum efficiency.
 func (bm *ButtonManager) monitorButton(btn *button) {
 	defer bm.wg.Done()
 
 	log.Printf("Monitoring button on pin %s", btn.config.PinName)
 
 	for {
-		select {
-		case <-bm.ctx.Done():
-			return
-		default:
-			// Wait for the pin to change state
-			if btn.pin.WaitForEdge(100 * time.Millisecond) {
-				// Read the current state
-				level := btn.pin.Read()
-				
-				// Check if button is pressed (LOW when using pull-up resistor)
-				if level == gpio.Low {
-					btn.mu.Lock()
-					now := time.Now()
-					
-					// Check debounce
-					if now.Sub(btn.lastPress) > btn.config.DebounceTime {
-						btn.lastPress = now
-						btn.mu.Unlock()
-						
-						// Call the callback in a goroutine to avoid blocking
-						go func(pinName string, callback ButtonCallback) {
-							if callback != nil {
-								callback(pinName)
-							}
-						}(btn.config.PinName, btn.config.Callback)
-						
-						log.Printf("Button pressed on pin %s", btn.config.PinName)
-					} else {
-						btn.mu.Unlock()
-					}
-				}
+		// Block until GPIO interrupt fires (edge detected)
+		if !btn.pin.WaitForEdge(-1) {
+			// Edge detection failed, check if we're shutting down
+			if bm.isShuttingDown() {
+				return
 			}
+			continue
+		}
+
+		// Check for shutdown signal
+		if bm.isShuttingDown() {
+			return
+		}
+
+		// Handle button press if debounce period has passed
+		if btn.isPressed() && btn.isDebouncePassed() {
+			btn.updateLastPress()
+			bm.invokeCallback(btn)
 		}
 	}
 }
 
-// Stop stops monitoring all buttons and cleans up resources
+// isShuttingDown checks if the context has been cancelled.
+func (bm *ButtonManager) isShuttingDown() bool {
+	select {
+	case <-bm.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// isPressed returns true if the button is currently pressed.
+// With pull-up resistors, LOW means pressed.
+func (btn *button) isPressed() bool {
+	return btn.pin.Read() == gpio.Low
+}
+
+// isDebouncePassed checks if enough time has passed since the last press.
+func (btn *button) isDebouncePassed() bool {
+	btn.mu.Lock()
+	defer btn.mu.Unlock()
+	return time.Since(btn.lastPress) > btn.config.DebounceTime
+}
+
+// updateLastPress records the current time as the last press time.
+func (btn *button) updateLastPress() {
+	btn.mu.Lock()
+	btn.lastPress = time.Now()
+	btn.mu.Unlock()
+}
+
+// invokeCallback executes the button's callback in a separate goroutine.
+func (bm *ButtonManager) invokeCallback(btn *button) {
+	log.Printf("Button pressed on pin %s", btn.config.PinName)
+	
+	if btn.config.Callback != nil {
+		go btn.config.Callback(btn.config.PinName)
+	}
+}
+
+// Stop gracefully shuts down all button monitoring and releases GPIO resources.
+// It's safe to call multiple times.
 func (bm *ButtonManager) Stop() {
+	// Signal all monitoring goroutines to stop
 	bm.mu.Lock()
 	if bm.cancel != nil {
 		bm.cancel()
 	}
 	bm.mu.Unlock()
 
-	// Wait for all monitoring goroutines to finish
+	// Wait for all goroutines to finish
 	bm.wg.Wait()
 
-	// Halt all pins
+	// Release GPIO pins
+	bm.haltAllPins()
+
+	log.Println("Stopped all button monitoring")
+}
+
+// haltAllPins releases all GPIO pin resources.
+func (bm *ButtonManager) haltAllPins() {
 	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
 	for _, btn := range bm.buttons {
 		if err := btn.pin.Halt(); err != nil {
 			log.Printf("Error halting pin %s: %v", btn.config.PinName, err)
 		}
 	}
-	bm.mu.Unlock()
-
-	log.Println("Stopped all button monitoring")
 }
 
-// GetButtonCount returns the number of configured buttons
+// GetButtonCount returns the number of configured buttons.
 func (bm *ButtonManager) GetButtonCount() int {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
