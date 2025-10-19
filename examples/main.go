@@ -8,6 +8,7 @@ import (
 	"time"
 
 	gpiobuttons "github.com/piotrpaczula/gpio-buttons-go"
+	"periph.io/x/conn/v3/gpio"
 )
 
 func main() {
@@ -23,6 +24,7 @@ func main() {
 	counter := 0
 	err = manager.AddButton(gpiobuttons.ButtonConfig{
 		PinName: "GPIO1_A2", // Replace with your actual pin name
+		Pull: gpio.PullNoChange,
 		Callback: func(pinName string) {
 			counter++
 			timestamp := time.Now().Format("15:04:05.000")
