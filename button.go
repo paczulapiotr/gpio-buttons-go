@@ -14,7 +14,7 @@ import (
 
 const (
 	defaultDebounceTime = 50 * time.Millisecond
-	defaultPull         = gpio.PullUp
+	defaultPull         = gpio.PullNoChange // No internal pull - use external resistors
 )
 
 // ButtonCallback is invoked when a button press is detected.
@@ -25,7 +25,7 @@ type ButtonConfig struct {
 	PinName      string         // GPIO pin name (e.g., "GPIO1_A0")
 	Callback     ButtonCallback // Function called on button press
 	DebounceTime time.Duration  // Minimum time between presses (default: 50ms)
-	Pull         gpio.Pull      // Pull resistor configuration (default: PullUp)
+	Pull         gpio.Pull      // Pull resistor configuration (default: PullNoChange - external resistor required)
 }
 
 // ButtonManager manages multiple GPIO button inputs with interrupt-driven detection.
@@ -63,6 +63,7 @@ func NewButtonManager() (*ButtonManager, error) {
 
 // AddButton registers a new button with the manager.
 // Must be called before Start().
+// Note: External pull-up resistor (10kΩ recommended) is required for reliable operation.
 func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -71,7 +72,8 @@ func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 	if config.DebounceTime == 0 {
 		config.DebounceTime = defaultDebounceTime
 	}
-	if config.Pull == gpio.PullNoChange {
+	// Default to PullNoChange (external pull-up required)
+	if config.Pull == 0 {
 		config.Pull = defaultPull
 	}
 
@@ -81,6 +83,7 @@ func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 		return fmt.Errorf("failed to find pin: %s", config.PinName)
 	}
 
+	// Configure pin as input with edge detection
 	if err := pin.In(config.Pull, gpio.BothEdges); err != nil {
 		return fmt.Errorf("failed to configure pin %s: %w", config.PinName, err)
 	}
@@ -90,7 +93,7 @@ func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 		config: config,
 	}
 
-	log.Printf("Added button on pin %s", config.PinName)
+	log.Printf("Added button on pin %s (external pull-up resistor required)", config.PinName)
 	return nil
 }
 

@@ -8,11 +8,12 @@ import (
 	"time"
 
 	gpiobuttons "github.com/piotrpaczula/gpio-buttons-go"
-	"periph.io/x/conn/v3/gpio"
 )
 
 func main() {
 	log.Println("Starting GPIO Button Example...")
+	log.Println("⚠️  IMPORTANT: External pull-up resistor (10kΩ) required!")
+	log.Println()
 
 	// Create a new button manager
 	manager, err := gpiobuttons.NewButtonManager()
@@ -20,20 +21,26 @@ func main() {
 		log.Fatalf("Failed to create button manager: %v", err)
 	}
 
-	// Add button
+	// Configure single button with counter and timestamp
+	// IMPORTANT: Replace pin name with actual pin from your system
+	// Run: cd tools/pin-discovery && go run main.go to discover available pins
+	// 
+	// Hardware setup required:
+	//   GPIO Pin ──┬── Button/Switch ── GND
+	//              └── 10kΩ resistor ── 3.3V
+	
 	counter := 0
 	err = manager.AddButton(gpiobuttons.ButtonConfig{
-		PinName: "GPIO1_A2", // Replace with your actual pin name
-		Pull: gpio.PullNoChange,
+		PinName: "GPIO11",
 		Callback: func(pinName string) {
 			counter++
 			timestamp := time.Now().Format("15:04:05.000")
-			log.Printf("🔵 Button pressed [%d] on %s at %s", counter, pinName, timestamp)
+			log.Printf("🔵 Button pressed [#%d] on %s at %s", counter, pinName, timestamp)
 		},
 		DebounceTime: 50 * time.Millisecond,
 	})
 	if err != nil {
-		log.Printf("Warning: Failed to add button 3: %v", err)
+		log.Fatalf("Failed to add button: %v", err)
 	}
 
 	// Start monitoring buttons
@@ -52,7 +59,7 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	log.Println("Button monitoring started. Press Ctrl+C to exit...")
-	log.Println("Press any of the 4 buttons to trigger their callbacks.")
+	log.Println("Press the button to see counter and timestamp.")
 
 	// Wait for interrupt signal
 	<-sigChan
