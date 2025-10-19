@@ -81,8 +81,14 @@ func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 		return fmt.Errorf("failed to find pin: %s", config.PinName)
 	}
 
-	if err := pin.In(config.Pull, gpio.BothEdges); err != nil {
-		return fmt.Errorf("failed to configure pin %s: %w", config.PinName, err)
+	// Try to configure with pull resistor first
+	err := pin.In(config.Pull, gpio.BothEdges)
+	if err != nil {
+		// If pull resistor fails, try without pull (requires external resistor)
+		log.Printf("Warning: Pin %s doesn't support pull resistors, using PullNoChange (external resistor required)", config.PinName)
+		if err := pin.In(gpio.PullNoChange, gpio.BothEdges); err != nil {
+			return fmt.Errorf("failed to configure pin %s: %w", config.PinName, err)
+		}
 	}
 
 	bm.buttons[config.PinName] = &button{
