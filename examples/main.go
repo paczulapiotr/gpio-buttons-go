@@ -12,7 +12,7 @@ import (
 
 func main() {
 	log.Println("Starting GPIO Button Example...")
-	log.Println("Tip: Run tools/pin-discovery to list gpiochips/lines and bias support.")
+	log.Println("ℹ️ Using INTERNAL pull-up (gpio.PullUp). Your pin must support it.")
 	log.Println()
 
 	// Create a new button manager
@@ -22,14 +22,15 @@ func main() {
 	}
 
 	// Configure single button with counter and timestamp
-	// IMPORTANT: Replace PinName with a valid chip:line from your system, e.g., "gpiochip0:23"
-	// Discover lines: cd tools/pin-discovery && go run main.go
+	// IMPORTANT: Replace PinName with a valid chip:line or line number from your system (e.g., "gpiochip0:23" or "23")
+	// Discover lines: cd tools/pin-discovery && go run main.go (or use `gpioinfo`)
 	// Typical wiring: internal PullUp + ActiveLow + button to GND
 	
 	counter := 0
 	err = manager.AddButton(gpiobuttons.ButtonConfig{
-		PinName:  "gpiochip0:23", // example; change to your line
-		ActiveLow: true,           // pressed -> logical 1
+		PinName:  "23",                // example; change to your line (or "gpiochip0:23")
+		Pull:     gpiobuttons.PullUp,  // Request internal pull-up (depends on kernel/pin support)
+		ActiveLow: true,               // Press = GND (logical 1)
 		Callback: func(pinName string) {
 			counter++
 			timestamp := time.Now().Format("15:04:05.000")
