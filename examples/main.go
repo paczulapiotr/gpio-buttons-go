@@ -28,7 +28,7 @@ func main() {
 	
 	counter := 0
 	err = manager.AddButton(gpiobuttons.ButtonConfig{
-		PinName:  "23",                // example; change to your line (or "gpiochip0:23")
+		PinName:  "gpiochip1:9",                // example; change to your line (or "gpiochip0:23")
 		Pull:     gpiobuttons.PullUp,  // Request internal pull-up (depends on kernel/pin support)
 		ActiveLow: true,               // Press = GND (logical 1)
 		Callback: func(pinName string) {
