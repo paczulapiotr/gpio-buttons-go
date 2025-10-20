@@ -5,120 +5,83 @@ import (
 	"log"
 	"sort"
 
-	"periph.io/x/conn/v3/gpio"
-	"periph.io/x/conn/v3/gpio/gpioreg"
-	"periph.io/x/host/v3"
+	gpiocdev "github.com/warthog618/go-gpiocdev"
 )
 
 func main() {
-	fmt.Println("Discovering available GPIO pins...")
+	fmt.Println("Discovering available GPIO chips/lines...")
 	fmt.Println("=====================================")
-	
-	// Initialize periph.io
-	if _, err := host.Init(); err != nil {
-		log.Fatalf("Failed to initialize periph.io: %v", err)
-	}
 
-	// Get all available pins
-	allPins := gpioreg.All()
-	
-	if len(allPins) == 0 {
-		fmt.Println("❌ No GPIO pins found!")
+	chipNames := gpiocdev.Chips()
+	if len(chipNames) == 0 {
+		fmt.Println("❌ No gpiochips found!")
 		fmt.Println("\nTroubleshooting:")
-		fmt.Println("1. Make sure you're running with sudo")
-		fmt.Println("2. Check if GPIO is enabled in your system")
-		fmt.Println("3. Try: ls /sys/class/gpio/")
+		fmt.Println("1. Run as root (sudo)")
+		fmt.Println("2. Kernel must have GPIO chardev (CONFIG_GPIO_CDEV)")
+		fmt.Println("3. Check: ls /dev/gpiochip*")
 		return
 	}
 
-	fmt.Printf("Found %d GPIO pins\n\n", len(allPins))
-
-	// Sort pins by name
-	var pinNames []string
-	pinMap := make(map[string]gpio.PinIO)
-	for _, pin := range allPins {
-		name := pin.Name()
-		pinNames = append(pinNames, name)
-		pinMap[name] = pin
+	// Flatten lines into a list of (chip, offset, name)
+	type lineInfo struct {
+		chip   string
+		offset int
+		name   string
 	}
-	sort.Strings(pinNames)
-
-	// Test each pin for pull resistor support
-	fmt.Println("Pin Name                  | Pull-Up Support | Pin Number")
-	fmt.Println("--------------------------|-----------------|------------")
-	
-	supportedPins := []string{}
-	
-	for _, name := range pinNames {
-		pin := pinMap[name]
-		
-		// Try to configure with pull-up
-		err := pin.In(gpio.PullUp, gpio.NoEdge)
-		pullSupport := "✅ YES"
+	var lines []lineInfo
+	for _, cname := range chipNames {
+		c, err := gpiocdev.NewChip(cname)
 		if err != nil {
-			pullSupport = "❌ NO"
-		} else {
-			supportedPins = append(supportedPins, name)
+			log.Printf("Skipping %s: %v", cname, err)
+			continue
 		}
-		
-		// Get pin number if available
-		pinNum := ""
-		if pin.Number() != -1 {
-			pinNum = fmt.Sprintf("%d", pin.Number())
+		n := c.Lines()
+		for off := 0; off < n; off++ {
+			li, err := c.LineInfo(off)
+			if err != nil {
+				continue
+			}
+			lines = append(lines, lineInfo{chip: cname, offset: off, name: li.Name})
 		}
-		
-		fmt.Printf("%-25s | %-15s | %s\n", name, pullSupport, pinNum)
-		
-		// Clean up
-		pin.Halt()
+		_ = c.Close()
+	}
+	sort.Slice(lines, func(i, j int) bool {
+		if lines[i].chip == lines[j].chip {
+			return lines[i].offset < lines[j].offset
+		}
+		return lines[i].chip < lines[j].chip
+	})
+
+	fmt.Println("Chip:Offset               | Bias Pull-Up Support | Name")
+	fmt.Println("--------------------------|----------------------|------")
+
+	supported := 0
+	checked := 0
+	for _, ln := range lines {
+		checked++
+		// Try to request the line as input with bias pull-up.
+		// Many lines may be busy or not support bias; ignore busy errors gracefully.
+		pullSupport := "❌ NO"
+		l, err := gpiocdev.RequestLine(ln.chip, ln.offset, gpiocdev.AsInput, gpiocdev.WithPullUp, gpiocdev.WithConsumer("pin-discovery"))
+		if err == nil {
+			pullSupport = "✅ YES"
+			supported++
+			_ = l.Close()
+		}
+
+		label := fmt.Sprintf("%s:%d", ln.chip, ln.offset)
+		fmt.Printf("%-26s | %-20s | %s\n", label, pullSupport, ln.name)
 	}
 
 	fmt.Println("\n=====================================")
-	fmt.Printf("✅ Pins with pull-up support: %d\n\n", len(supportedPins))
-	
-	if len(supportedPins) > 0 {
-		fmt.Println("🎯 RECOMMENDED PINS FOR BUTTONS:")
-		fmt.Println("Use these pin names in your ButtonConfig:")
-		fmt.Println()
-		count := 0
-		for _, name := range supportedPins {
-			if count >= 10 {
-				break
-			}
-			pin := pinMap[name]
-			pinNum := ""
-			if pin.Number() != -1 {
-				pinNum = fmt.Sprintf(" (Pin #%d)", pin.Number())
-			}
-			fmt.Printf("  • %s%s\n", name, pinNum)
-			count++
-		}
-		
-		if len(supportedPins) > 10 {
-			fmt.Printf("\n  ... and %d more pins\n", len(supportedPins)-10)
-		}
-		
-		fmt.Println("\nExample usage:")
-		if len(supportedPins) >= 4 {
-			fmt.Println("```go")
-			fmt.Printf("manager.AddButton(gpiobuttons.ButtonConfig{\n")
-			fmt.Printf("    PinName: \"%s\",\n", supportedPins[0])
-			fmt.Printf("    Callback: button1Handler,\n")
-			fmt.Printf("})\n")
-			fmt.Println("```")
-		}
+	fmt.Printf("✅ Lines with pull-up support: %d (out of %d checked)\n\n", supported, checked)
+
+	if supported == 0 {
+		fmt.Println("⚠️  No lines accepted bias=pull-up via userspace request.")
+		fmt.Println("This can mean: kernel < v5.5, driver doesn't expose bias via gpiocdev, or line is reserved.")
+		fmt.Println("Options: use external pull resistors, or set bias in device tree overlays.")
 	} else {
-		fmt.Println("⚠️  No pins found with pull-up support!")
-		fmt.Println("You'll need to use external pull-up resistors.")
-		fmt.Println("\nExample with external resistor:")
-		if len(pinNames) > 0 {
-			fmt.Println("```go")
-			fmt.Printf("manager.AddButton(gpiobuttons.ButtonConfig{\n")
-			fmt.Printf("    PinName: \"%s\",\n", pinNames[0])
-			fmt.Printf("    Callback: handler,\n")
-			fmt.Printf("    Pull: gpio.PullNoChange, // External resistor required\n")
-			fmt.Printf("})\n")
-			fmt.Println("```")
-		}
+		fmt.Println("Example usage with this library:")
+		fmt.Println("  PinName: \"gpiochip0:23\"  // chip:line format")
 	}
 }

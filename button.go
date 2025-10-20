@@ -4,28 +4,39 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"periph.io/x/conn/v3/gpio"
-	"periph.io/x/conn/v3/gpio/gpioreg"
-	"periph.io/x/host/v3"
+	gpiocdev "github.com/warthog618/go-gpiocdev"
 )
 
 const (
 	defaultDebounceTime = 50 * time.Millisecond
-	defaultPull         = gpio.PullNoChange // No internal pull - use external resistors
 )
 
 // ButtonCallback is invoked when a button press is detected.
 type ButtonCallback func(pinName string)
 
+// Pull represents internal bias configuration.
+type Pull int
+
+const (
+	PullNoChange Pull = iota // Leave kernel default
+	PullUp                   // Request internal pull-up
+	PullDown                 // Request internal pull-down
+	PullDisabled             // Disable internal bias
+)
+
 // ButtonConfig defines the configuration for a single GPIO button.
+// PinName accepts formats like "gpiochip0:23" or just "23" (defaults to gpiochip0).
 type ButtonConfig struct {
-	PinName      string         // GPIO pin name (e.g., "GPIO1_A0")
+	PinName      string         // Logical pin identifier: "gpiochipX:line" or "line"
 	Callback     ButtonCallback // Function called on button press
 	DebounceTime time.Duration  // Minimum time between presses (default: 50ms)
-	Pull         gpio.Pull      // Pull resistor configuration (default: PullNoChange - external resistor required)
+	Pull         Pull           // Internal pull configuration (requires kernel support)
+	ActiveLow    bool           // Treat low level as logical 1 (typical for buttons to GND)
 }
 
 // ButtonManager manages multiple GPIO button inputs with interrupt-driven detection.
@@ -39,21 +50,17 @@ type ButtonManager struct {
 
 // button represents the internal state of a single button.
 type button struct {
-	pin       gpio.PinIO
+	line      *gpiocdev.Line
+	chip      string
+	offset    int
 	config    ButtonConfig
 	lastPress time.Time
 	mu        sync.Mutex
 }
 
 // NewButtonManager creates and initializes a new ButtonManager.
-// It initializes the periph.io host for GPIO access.
 func NewButtonManager() (*ButtonManager, error) {
-	if _, err := host.Init(); err != nil {
-		return nil, fmt.Errorf("failed to initialize periph.io: %w", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	
 	return &ButtonManager{
 		buttons: make(map[string]*button),
 		ctx:     ctx,
@@ -63,7 +70,6 @@ func NewButtonManager() (*ButtonManager, error) {
 
 // AddButton registers a new button with the manager.
 // Must be called before Start().
-// Note: External pull-up resistor (10kΩ recommended) is required for reliable operation.
 func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -72,148 +78,130 @@ func (bm *ButtonManager) AddButton(config ButtonConfig) error {
 	if config.DebounceTime == 0 {
 		config.DebounceTime = defaultDebounceTime
 	}
-	// Default to PullNoChange (external pull-up required)
-	if config.Pull == 0 {
-		config.Pull = defaultPull
+
+	chip, offset, err := resolveChipLine(config.PinName)
+	if err != nil {
+		return err
 	}
 
-	// Validate and configure GPIO pin
-	pin := gpioreg.ByName(config.PinName)
-	if pin == nil {
-		return fmt.Errorf("failed to find pin: %s", config.PinName)
+	// Build request options and try fallbacks. Use event handler for rising edge (press).
+	base := []gpiocdev.LineReqOption{
+		gpiocdev.AsInput,
+		gpiocdev.WithConsumer("gpio-buttons-go"),
+		gpiocdev.WithRisingEdge,
+	}
+	if config.ActiveLow {
+		base = append(base, gpiocdev.AsActiveLow)
 	}
 
-	// Configure pin as input with edge detection
-	if err := pin.In(config.Pull, gpio.BothEdges); err != nil {
-		return fmt.Errorf("failed to configure pin %s: %w", config.PinName, err)
+	// Local debounce gate in case kernel debounce isn't available/enabled
+	var last time.Time
+	handler := func(evt gpiocdev.LineEvent) {
+		// evt.Type is RisingEdge for press due to WithRisingEdge
+		now := time.Now()
+		if config.DebounceTime > 0 && !last.IsZero() && now.Sub(last) <= config.DebounceTime/2 {
+			// Minimal guard against event bursts; kernel debounce should handle most cases
+			return
+		}
+		if config.Callback != nil {
+			pinName := config.PinName
+			if pinName == "" {
+				pinName = fmt.Sprintf("%s:%d", chip, offset)
+			}
+			config.Callback(pinName)
+		}
+		last = now
 	}
 
-	bm.buttons[config.PinName] = &button{
-		pin:    pin,
+	// Construct option sets: full (debounce + bias), no bias, no debounce, base only
+	var combos [][]gpiocdev.LineReqOption
+	{
+		full := append([]gpiocdev.LineReqOption{}, base...)
+		full = append(full, gpiocdev.WithEventHandler(handler))
+		if config.DebounceTime > 0 {
+			full = append(full, gpiocdev.WithDebounce(config.DebounceTime))
+		}
+		if pOpt := pullOption(config.Pull); pOpt != nil {
+			full = append(full, pOpt)
+		}
+		combos = append(combos, full)
+
+		if pOpt := pullOption(config.Pull); pOpt != nil {
+			noBias := append([]gpiocdev.LineReqOption{}, base...)
+			noBias = append(noBias, gpiocdev.WithEventHandler(handler))
+			if config.DebounceTime > 0 {
+				noBias = append(noBias, gpiocdev.WithDebounce(config.DebounceTime))
+			}
+			combos = append(combos, noBias)
+		}
+		if config.DebounceTime > 0 {
+			noDeb := append([]gpiocdev.LineReqOption{}, base...)
+			noDeb = append(noDeb, gpiocdev.WithEventHandler(handler))
+			if pOpt := pullOption(config.Pull); pOpt != nil {
+				noDeb = append(noDeb, pOpt)
+			}
+			combos = append(combos, noDeb)
+		}
+		baseOnly := append([]gpiocdev.LineReqOption{}, base...)
+		baseOnly = append(baseOnly, gpiocdev.WithEventHandler(handler))
+		combos = append(combos, baseOnly)
+	}
+
+	var line *gpiocdev.Line
+	var reqErr error
+	for _, opts := range combos {
+		line, reqErr = gpiocdev.RequestLine(chip, offset, opts...)
+		if reqErr == nil {
+			break
+		}
+	}
+	if reqErr != nil {
+		return fmt.Errorf("failed to request line %s:%d: %w", chip, offset, reqErr)
+	}
+
+	btn := &button{
+		line:   line,
+		chip:   chip,
+		offset: offset,
 		config: config,
 	}
+	key := config.PinName
+	if key == "" {
+		key = fmt.Sprintf("%s:%d", chip, offset)
+	}
+	bm.buttons[key] = btn
 
-	log.Printf("Added button on pin %s (external pull-up resistor required)", config.PinName)
+	log.Printf("Added button on %s:%d (ActiveLow=%v, Debounce=%s, Pull=%v)", chip, offset, config.ActiveLow, config.DebounceTime, config.Pull)
 	return nil
 }
 
-// Start begins monitoring all configured buttons using hardware interrupts.
-// Returns an error if no buttons are configured.
+// Start is kept for API compatibility; with gpiocdev we attach event handlers at AddButton.
 func (bm *ButtonManager) Start() error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
-
 	if len(bm.buttons) == 0 {
 		return fmt.Errorf("no buttons configured")
 	}
-
-	for _, btn := range bm.buttons {
-		bm.wg.Add(1)
-		go bm.monitorButton(btn)
-	}
-
-	log.Printf("Started monitoring %d button(s)", len(bm.buttons))
+	log.Printf("Monitoring %d button(s)", len(bm.buttons))
 	return nil
 }
 
-// monitorButton handles button press detection using GPIO hardware interrupts.
-// This is event-driven, not polling-based, for maximum efficiency.
-func (bm *ButtonManager) monitorButton(btn *button) {
-	defer bm.wg.Done()
-
-	log.Printf("Monitoring button on pin %s", btn.config.PinName)
-
-	for {
-		// Block until GPIO interrupt fires (edge detected)
-		if !btn.pin.WaitForEdge(-1) {
-			// Edge detection failed, check if we're shutting down
-			if bm.isShuttingDown() {
-				return
-			}
-			continue
-		}
-
-		// Check for shutdown signal
-		if bm.isShuttingDown() {
-			return
-		}
-
-		// Handle button press if debounce period has passed
-		if btn.isPressed() && btn.isDebouncePassed() {
-			btn.updateLastPress()
-			bm.invokeCallback(btn)
-		}
-	}
-}
-
-// isShuttingDown checks if the context has been cancelled.
-func (bm *ButtonManager) isShuttingDown() bool {
-	select {
-	case <-bm.ctx.Done():
-		return true
-	default:
-		return false
-	}
-}
-
-// isPressed returns true if the button is currently pressed.
-// With pull-up resistors, LOW means pressed.
-func (btn *button) isPressed() bool {
-	return btn.pin.Read() == gpio.Low
-}
-
-// isDebouncePassed checks if enough time has passed since the last press.
-func (btn *button) isDebouncePassed() bool {
-	btn.mu.Lock()
-	defer btn.mu.Unlock()
-	return time.Since(btn.lastPress) > btn.config.DebounceTime
-}
-
-// updateLastPress records the current time as the last press time.
-func (btn *button) updateLastPress() {
-	btn.mu.Lock()
-	btn.lastPress = time.Now()
-	btn.mu.Unlock()
-}
-
-// invokeCallback executes the button's callback in a separate goroutine.
-func (bm *ButtonManager) invokeCallback(btn *button) {
-	log.Printf("Button pressed on pin %s", btn.config.PinName)
-	
-	if btn.config.Callback != nil {
-		go btn.config.Callback(btn.config.PinName)
-	}
-}
+// Removed monitor goroutine: events handled by WithEventHandler.
 
 // Stop gracefully shuts down all button monitoring and releases GPIO resources.
-// It's safe to call multiple times.
 func (bm *ButtonManager) Stop() {
-	// Signal all monitoring goroutines to stop
 	bm.mu.Lock()
-	if bm.cancel != nil {
-		bm.cancel()
+	// Close all lines (this waits for any in-flight event handler to return)
+	for _, btn := range bm.buttons {
+		if btn.line != nil {
+			if err := btn.line.Close(); err != nil {
+				log.Printf("Error closing line %s:%d: %v", btn.chip, btn.offset, err)
+			}
+		}
 	}
 	bm.mu.Unlock()
 
-	// Wait for all goroutines to finish
-	bm.wg.Wait()
-
-	// Release GPIO pins
-	bm.haltAllPins()
-
 	log.Println("Stopped all button monitoring")
-}
-
-// haltAllPins releases all GPIO pin resources.
-func (bm *ButtonManager) haltAllPins() {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	for _, btn := range bm.buttons {
-		if err := btn.pin.Halt(); err != nil {
-			log.Printf("Error halting pin %s: %v", btn.config.PinName, err)
-		}
-	}
 }
 
 // GetButtonCount returns the number of configured buttons.
@@ -221,4 +209,41 @@ func (bm *ButtonManager) GetButtonCount() int {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	return len(bm.buttons)
+}
+
+// Helpers
+// Map Pull to appropriate request option for v0.9.1.
+func pullOption(p Pull) gpiocdev.LineReqOption {
+	switch p {
+	case PullUp:
+		return gpiocdev.WithPullUp
+	case PullDown:
+		return gpiocdev.WithPullDown
+	case PullDisabled:
+		return gpiocdev.WithBiasDisabled
+	default:
+		return nil // WithBiasAsIs is default
+	}
+}
+
+// resolveChipLine parses PinName into chip and offset.
+// Accepts "gpiochipX:line" or just "line" (defaults to gpiochip0).
+func resolveChipLine(pinName string) (string, int, error) {
+	p := strings.TrimSpace(pinName)
+	if p == "" {
+		return "", 0, fmt.Errorf("PinName is required; format 'gpiochipX:line' or 'line'")
+	}
+	if strings.Contains(p, ":") {
+		parts := strings.SplitN(p, ":", 2)
+		off, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid line offset %q: %w", parts[1], err)
+		}
+		return parts[0], off, nil
+	}
+	off, err := strconv.Atoi(p)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid PinName %q", p)
+	}
+	return "gpiochip0", off, nil
 }
